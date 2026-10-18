@@ -5,4 +5,5 @@ state.json
 secrets.json
 config.json
 bridge.log
+.wrangler/
 __pycache__/
