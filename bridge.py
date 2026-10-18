@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import queue
+import re
 import socket
 import ssl
 import sys
@@ -33,6 +34,7 @@ LOG_PATH = HERE / "bridge.log"
 LOCK_PORT = 47811
 
 TG_LIMIT = 3800          # длина куска сообщения (лимит Telegram — 4096)
+VOICE_TTS_LIMIT = 700    # сколько символов ответа озвучивать голосом
 POLL_INTERVAL = 2.5      # как часто проверять ответ агента
 STATUS_EVERY = 15        # как часто обновлять сообщение "работаю"
 PROMPT_TIMEOUT = 3600    # максимум ожидания ответа, с
@@ -147,13 +149,17 @@ class Tg:
 
     def download(self, file_path: str, http_timeout: float = 300) -> bytes:
         """Скачивает файл из Telegram — через релей (сам api.telegram.org заблокирован)."""
-        payload = json.dumps({"method": "downloadFile", "params": {"file_path": file_path}}).encode()
+        return self.post_raw({"method": "downloadFile", "params": {"file_path": file_path}}, http_timeout)
+
+    def post_raw(self, payload: dict, http_timeout: float = 300) -> bytes:
+        """Отправляет произвольный запрос в релей и возвращает сырой ответ."""
+        body = json.dumps(payload).encode()
         modes = [None, "tls12"] if self.url.startswith("https") else [None]
         last_exc = None
         for mode in modes:
             req = urllib.request.Request(
                 self.url,
-                data=payload,
+                data=body,
                 headers={
                     "Content-Type": "application/json",
                     "User-Agent": "tg-bridge/1.0",
@@ -168,12 +174,34 @@ class Tg:
                     return resp.read()
             except ssl.SSLError as exc:
                 last_exc = exc
-                log.warning("TLS-ошибка при скачивании (%s): %s", mode or "по умолчанию", exc)
+                log.warning("TLS-ошибка (%s): %s", mode or "по умолчанию", exc)
                 continue
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 break
-        raise RuntimeError(f"download error: {last_exc}")
+        raise RuntimeError(f"post error: {last_exc}")
+
+    def send_voice(self, chat_id: int, path: Path, caption: str = "") -> bool:
+        """Отправляет голосовое сообщение (ogg/opus) через релей."""
+        payload = {
+            "method": "sendVoice",
+            "params": {"chat_id": chat_id, **({"caption": caption[:1000]} if caption else {})},
+            "files": [
+                {
+                    "field": "voice",
+                    "name": path.name,
+                    "data_base64": base64.b64encode(path.read_bytes()).decode(),
+                }
+            ],
+        }
+        try:
+            data = json.loads(self.post_raw(payload).decode("utf-8", "replace"))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("sendVoice: %s", exc)
+            return False
+        if not data.get("ok"):
+            log.warning("sendVoice -> %s", json.dumps(data, ensure_ascii=False)[:200])
+        return bool(data.get("ok"))
 
 
 # ---------------------------------------------------------------- opencode
@@ -318,6 +346,85 @@ def transcribe(data: bytes, model_name: str = "small", language: str = "ru") -> 
             pass
 
 
+# ---------------------------------------------------------------- озвучка ответов
+
+def clean_for_speech(text: str, limit: int) -> str:
+    """Готовит ответ к озвучке: без разметки, кода и лишних пустых строк."""
+    text = re.sub(r"```.*?```", " Код пропущен. ", text, flags=re.S)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"\*\*([^*]*)\*\*", r"\1", text)
+    text = re.sub(r"\*([^*]*)\*", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"^\s{0,3}[#>\-*+]\s+", "", text, flags=re.M)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{2,}", "\n", text).strip()
+    if len(text) > limit:
+        text = text[:limit].rsplit(" ", 1)[0] + "… Дальше — текстом."
+    return text
+
+
+def _as_list(value) -> list:
+    """Ресемплер в разных версиях PyAV отдаёт то кадр, то список кадров."""
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def tts_ogg(text: str, voice_hint: str = "", rate: int = 0) -> Path:
+    """Озвучивает текст голосом Windows и отдаёт ogg/opus — формат голосовых Telegram."""
+    import av
+    import win32com.client
+
+    sapi = win32com.client.Dispatch("SAPI.SpVoice")
+    voices = sapi.GetVoices()
+    hint = (voice_hint or "").lower()
+    chosen = None
+    for i in range(voices.Count):  # сначала ищем голос по подсказке из конфига
+        if hint and hint in voices.Item(i).GetDescription().lower():
+            chosen = voices.Item(i)
+            break
+    if chosen is None and not hint:  # иначе — первый русский
+        for i in range(voices.Count):
+            low = voices.Item(i).GetDescription().lower()
+            if "russian" in low or "irina" in low:
+                chosen = voices.Item(i)
+                break
+    if chosen is not None:
+        sapi.Voice = chosen
+    sapi.Rate = max(-10, min(10, rate))
+
+    wav_path = Path(tempfile.gettempdir()) / f"tg-tts-{time.time_ns()}.wav"
+    ogg_path = wav_path.with_suffix(".ogg")
+    stream = win32com.client.Dispatch("SAPI.SpFileStream")
+    stream.Open(str(wav_path), 3, False)  # 3 = создать файл для записи
+    sapi.AudioOutputStream = stream
+    sapi.Speak(text)
+    stream.Close()
+
+    with av.open(str(wav_path)) as src, av.open(str(ogg_path), "w", format="ogg") as dst:
+        codec = "libopus" if "libopus" in getattr(av, "codecs_available", set()) else "opus"
+        out = dst.add_stream(codec, rate=48000)
+        out.bit_rate = 32000
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=48000)
+        for frame in src.decode(audio=0):
+            for ready in _as_list(resampler.resample(frame)):
+                ready.pts = None
+                for packet in out.encode(ready):
+                    dst.mux(packet)
+        for ready in _as_list(resampler.resample(None)):
+            ready.pts = None
+            for packet in out.encode(ready):
+                dst.mux(packet)
+        for packet in out.encode(None):
+            dst.mux(packet)
+    try:
+        wav_path.unlink()
+    except OSError:
+        pass
+    log.info("озвучка готова: %s байт", ogg_path.stat().st_size)
+    return ogg_path
+
+
 def single_instance() -> socket.socket | None:
     s = socket.socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
@@ -332,12 +439,13 @@ def single_instance() -> socket.socket | None:
 
 HELP = (
     "Я — твой агент OpenCode на компьютере. Пиши задачу текстом или наговаривай голосом —\n"
-    "голосовые я расшифрую сам.\n\n"
+    "голосовые я расшифрую сам и, если хочешь, отвечу тоже голосом.\n\n"
     "Команды:\n"
     "/new — начать новую сессию (чистый контекст)\n"
     "/status — что сейчас происходит\n"
     "/stop — прервать текущую задачу\n"
     "/work <папка> — новая сессия в указанной папке\n"
+    "/voice on|off|auto — отвечать голосом (сейчас: auto — на голосовые)\n"
     "/help — эта справка\n\n"
     "Когда я спрашиваю разрешение на действие — пришлю кнопки «Разрешить / Всегда / Отклонить»."
 )
@@ -477,6 +585,25 @@ class Bridge:
                 self.tg.send(chat_id, f"Готово, работаю в:\n{arg}\nID: {sid}")
             except Exception as exc:  # noqa: BLE001
                 self.tg.send(chat_id, f"Не получилось открыть папку:\n{exc}")
+        elif cmd == "voice":
+            arg = arg.lower()
+            if arg in ("on", "always", "вкл", "да"):
+                mode = "on"
+            elif arg in ("off", "never", "выкл", "нет"):
+                mode = "off"
+            elif arg in ("auto", ""):
+                mode = "auto"
+            else:
+                self.tg.send(chat_id, "Напиши так: /voice on | off | auto")
+                return
+            with self.lock:
+                self.state["voice_reply"] = mode
+            self.save_state()
+            self.tg.send(
+                chat_id,
+                f"Голосовые ответы: {mode}\n"
+                "(auto — отвечаю голосом на голосовые, on — всегда, off — только текстом)",
+            )
         elif cmd == "status":
             self.tg.send(chat_id, self.status_text())
         elif cmd == "stop":
@@ -619,9 +746,41 @@ class Bridge:
             self.tg.send(chat_id, "🎤 В голосовом не разобрал слов. Попробуй ещё раз или напиши текстом.")
             return
         self.tg.send(chat_id, f"🎤 «{text}»")
-        self.run_prompt(text, chat_id)
+        self.run_prompt(text, chat_id, by_voice=True)
 
-    def run_prompt(self, text: str, chat_id: int):
+    def voice_mode(self) -> str:
+        return self.state.get("voice_reply") or self.cfg.get("voice_reply", "auto")
+
+    def want_voice(self, by_voice: bool) -> bool:
+        mode = self.voice_mode()
+        if mode == "on":
+            return True
+        if mode == "off":
+            return False
+        return by_voice
+
+    def speak_answer(self, chat_id: int, answer: str):
+        """Озвучивает ответ и присылает его голосовым сообщением."""
+        try:
+            spoken = clean_for_speech(answer, VOICE_TTS_LIMIT)
+            if not spoken:
+                return
+            self.tg.call("sendChatAction", chat_id=chat_id, action="record_voice")
+            path = tts_ogg(
+                spoken,
+                str(self.cfg.get("tts_voice", "")),
+                int(self.cfg.get("tts_rate", 0)),
+            )
+            ok = self.tg.send_voice(chat_id, path)
+            log.info("голосовой ответ %s", "отправлен" if ok else "не ушёл")
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        except Exception as exc:  # noqa: BLE001
+            log.exception("не смог озвучить ответ: %s", exc)
+
+    def run_prompt(self, text: str, chat_id: int, by_voice: bool = False):
         self.busy = True
         sid = self.ensure_session()
         try:
@@ -675,6 +834,8 @@ class Bridge:
                 )
             self.tg.send_long(chat_id, answer)
             log.info("задача выполнена за %s, ответ %s символов", took, len(answer))
+            if self.want_voice(by_voice):
+                self.speak_answer(chat_id, answer)
         finally:
             self.busy = False
 
