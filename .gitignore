@@ -1,0 +1,8 @@
+.token
+.device.json
+opencode-api.json
+state.json
+secrets.json
+config.json
+bridge.log
+__pycache__/

@@ -1,0 +1,8 @@
+name = "tg-relay"
+main = "cf-worker.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+# Секреты задаются командой:
+#   npx wrangler secret bulk secrets.json
+# (файл secrets.json: {"TG_TOKEN": "...", "RELAY_KEY": "..."})
