@@ -1,0 +1,25 @@
+name: bridge
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: smoke test
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_USER_ID: ${{ secrets.TG_USER_ID }}
+          OPC_URL: ${{ secrets.OPC_URL }}
+          OPC_USER: ${{ secrets.OPC_USER }}
+          OPC_PASS: ${{ secrets.OPC_PASS }}
+        run: python bridge.py
