@@ -14,10 +14,12 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import queue
 import socket
 import ssl
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -143,17 +145,52 @@ class Tg:
             self.send(chat_id, text[:cut])
             text = text[cut:].lstrip("\n")
 
+    def download(self, file_path: str, http_timeout: float = 300) -> bytes:
+        """Скачивает файл из Telegram — через релей (сам api.telegram.org заблокирован)."""
+        payload = json.dumps({"method": "downloadFile", "params": {"file_path": file_path}}).encode()
+        modes = [None, "tls12"] if self.url.startswith("https") else [None]
+        last_exc = None
+        for mode in modes:
+            req = urllib.request.Request(
+                self.url,
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "tg-bridge/1.0",
+                    "x-relay-key": self.key,
+                },
+            )
+            try:
+                kwargs = {"timeout": http_timeout}
+                if mode == "tls12":
+                    kwargs["context"] = _tls12_context()
+                with urllib.request.urlopen(req, **kwargs) as resp:
+                    return resp.read()
+            except ssl.SSLError as exc:
+                last_exc = exc
+                log.warning("TLS-ошибка при скачивании (%s): %s", mode or "по умолчанию", exc)
+                continue
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                break
+        raise RuntimeError(f"download error: {last_exc}")
+
 
 # ---------------------------------------------------------------- opencode
 
 class Opc:
-    def __init__(self, base: str, password: str):
+    def __init__(self, base: str, password: str = ""):
         self.base = base.rstrip("/")
-        self.auth = "Basic " + base64.b64encode(f"opencode:{password}".encode()).decode()
+        self.auth = (
+            "Basic " + base64.b64encode(f"opencode:{password}".encode()).decode()
+            if password
+            else None
+        )
 
     def call(self, method: str, path: str, body=None, timeout: float = 60):
+        headers = {"Authorization": self.auth} if self.auth else {}
         status, data = http_json(
-            self.base + path, method=method, body=body, headers={"Authorization": self.auth}, timeout=timeout
+            self.base + path, method=method, body=body, headers=headers, timeout=timeout
         )
         if status >= 400:
             raise RuntimeError(
@@ -241,6 +278,46 @@ def fmt_seconds(sec: float) -> str:
     return f"{sec // 60} мин {sec % 60} с"
 
 
+# ---------------------------------------------------------------- распознавание речи
+
+_STT_MODEL = None
+_STT_NAME = ""
+_STT_LOCK = threading.Lock()
+
+
+def get_stt(model_name: str):
+    """Модель распознавания речи грузится один раз и остаётся в памяти."""
+    global _STT_MODEL, _STT_NAME
+    with _STT_LOCK:
+        if _STT_MODEL is None:
+            from faster_whisper import WhisperModel  # тяжёлый импорт — только под голосовые
+
+            log.info("загружаю модель распознавания «%s» (первый раз качает ~%s МБ)", model_name, "500")
+            _STT_MODEL = WhisperModel(model_name, device="cpu", compute_type="int8")
+            _STT_NAME = model_name
+            log.info("модель распознавания «%s» готова", model_name)
+        return _STT_MODEL
+
+
+def transcribe(data: bytes, model_name: str = "small", language: str = "ru") -> str:
+    model = get_stt(model_name)
+    tmp = tempfile.NamedTemporaryFile(suffix=".oga", delete=False)
+    tmp.write(data)
+    tmp.close()
+    try:
+        segments, info = model.transcribe(
+            tmp.name, language=language or None, vad_filter=True, beam_size=1
+        )
+        text = " ".join(seg.text.strip() for seg in segments).strip()
+        log.info("распознано %.1f с аудио -> %s символов", info.duration or 0, len(text))
+        return text
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
 def single_instance() -> socket.socket | None:
     s = socket.socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
@@ -254,7 +331,8 @@ def single_instance() -> socket.socket | None:
 # ---------------------------------------------------------------- мост
 
 HELP = (
-    "Я — твой агент OpenCode на компьютере. Пиши задачу обычным текстом.\n\n"
+    "Я — твой агент OpenCode на компьютере. Пиши задачу текстом или наговаривай голосом —\n"
+    "голосовые я расшифрую сам.\n\n"
     "Команды:\n"
     "/new — начать новую сессию (чистый контекст)\n"
     "/status — что сейчас происходит\n"
@@ -360,12 +438,21 @@ class Bridge:
             return
         text = (msg.get("text") or "").strip()
         if not text:
-            self.tg.send(chat_id, "Пока я умею только текст 🙂")
+            voice = msg.get("voice") or msg.get("audio") or msg.get("video_note")
+            if voice and voice.get("file_id"):
+                self.q.put({"kind": "voice", "file_id": voice["file_id"], "chat_id": chat_id})
+                if self.busy:
+                    self.tg.send(chat_id, "⏳ Принял, поставлю в очередь после текущей задачи.")
+                return
+            if msg.get("photo") or msg.get("document"):
+                self.tg.send(chat_id, "Картинки и файлы пока не понимаю 🙂 Напиши текстом или голосом.")
+                return
+            self.tg.send(chat_id, "Пока я умею текст и голосовые сообщения 🙂")
             return
         if text.startswith("/"):
             self.handle_command(text, chat_id)
             return
-        self.q.put((text, chat_id))
+        self.q.put({"kind": "text", "text": text, "chat_id": chat_id})
         if self.busy:
             self.tg.send(chat_id, "⏳ Принял, поставлю в очередь после текущей задачи.")
 
@@ -481,14 +568,58 @@ class Bridge:
     def worker_loop(self):
         while not self.stop_flag:
             try:
-                text, chat_id = self.q.get(timeout=1)
+                item = self.q.get(timeout=1)
             except queue.Empty:
                 continue
             try:
-                self.run_prompt(text, chat_id)
+                if item.get("kind") == "voice":
+                    self.run_voice(item)
+                else:
+                    self.run_prompt(item["text"], item["chat_id"])
             except Exception as exc:  # noqa: BLE001
                 log.exception("ошибка выполнения задачи: %s", exc)
-                self.tg.send(chat_id, f"⚠️ Ошибка: {str(exc)[:400]}")
+                self.tg.send(item["chat_id"], f"⚠️ Ошибка: {str(exc)[:400]}")
+
+    def run_voice(self, item: dict):
+        """Голосовое сообщение: скачать через релей -> расшифровать -> выполнить как задачу."""
+        chat_id = item["chat_id"]
+        status_id = None
+        try:
+            self.busy = True
+            status = self.tg.send(chat_id, "🎤 Слушаю…")
+            status_id = (status or {}).get("message_id")
+            self.tg.call("sendChatAction", chat_id=chat_id, action="typing")
+            info = self.tg.call("getFile", file_id=item["file_id"]) or {}
+            path = info.get("file_path")
+            if not path:
+                raise RuntimeError("Telegram не отдал файл голосового")
+            data = self.tg.download(path)
+            log.info("получено голосовое: %s байт", len(data))
+            text = transcribe(
+                data,
+                self.cfg.get("stt_model", "small"),
+                self.cfg.get("stt_language", "ru"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("не смог распознать голос: %s", exc)
+            if status_id:
+                self.tg.call(
+                    "editMessageText",
+                    chat_id=chat_id,
+                    message_id=status_id,
+                    text=f"⚠️ Не смог разобрать голос: {str(exc)[:200]}",
+                )
+            return
+        finally:
+            self.busy = False
+
+        if status_id:
+            self.tg.call("deleteMessage", chat_id=chat_id, message_id=status_id)
+        if not text:
+            self.tg.send(chat_id, "🎤 В голосовом не разобрал слов. Попробуй ещё раз или напиши текстом.")
+            return
+        self.tg.send(chat_id, f"🎤 «{text}»")
+        self.run_prompt(text, chat_id)
 
     def run_prompt(self, text: str, chat_id: int):
         self.busy = True
@@ -568,12 +699,15 @@ class Bridge:
             time.sleep(5)
 
 
-def read_password(service_json: str) -> str:
-    data = load_json(Path(service_json), {})
-    pw = data.get("password")
-    if not pw:
-        raise RuntimeError(f"в {service_json} нет поля password")
-    return pw
+def read_password(opencode_cfg: dict) -> str:
+    """Пароль сервера OpenCode: из конфига, из service.json или никакой (если сервер без пароля)."""
+    pw = opencode_cfg.get("password")
+    if pw:
+        return pw
+    path = opencode_cfg.get("service_json")
+    if path and Path(path).exists():
+        return load_json(Path(path), {}).get("password", "") or ""
+    return ""
 
 
 def main():
@@ -585,7 +719,7 @@ def main():
     if not cfg:
         raise SystemExit(f"нет конфига {CONFIG_PATH}")
     tg = Tg(cfg["relay_url"], cfg["relay_key"])
-    opc = Opc(cfg["opencode"]["base"], read_password(cfg["opencode"]["service_json"]))
+    opc = Opc(cfg["opencode"]["base"], read_password(cfg["opencode"]))
     Bridge(cfg, tg, opc).run()
 
 

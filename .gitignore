@@ -5,5 +5,7 @@ state.json
 secrets.json
 config.json
 bridge.log
+relay-key-work.txt
+ИНСТРУКЦИЯ-*.md
 .wrangler/
 __pycache__/
